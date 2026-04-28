@@ -8,8 +8,8 @@ import java.time.Instant;
 @Table(
         name = "step_records",
         uniqueConstraints = @UniqueConstraint(
-                name = "uk_step_records_exec_step",
-                columnNames = {"execution_id", "step_id"}
+                name = "uk_step_records_exec_step_attempt",
+                columnNames = {"execution_id", "step_id", "attempt"}
         )
 )
 public class StepRecord {

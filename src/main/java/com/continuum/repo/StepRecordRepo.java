@@ -10,4 +10,6 @@ public interface StepRecordRepo extends JpaRepository<StepRecord, Long> {
     List<StepRecord> findByExecutionIdOrderByCreatedAtAsc(Long executionId);
 
     Optional<StepRecord> findFirstByExecutionIdAndStepIdOrderByAttemptDesc(Long executionId, String stepId);
+
+    boolean existsByExecutionIdAndStepIdAndAttempt(Long executionId, String stepId, int attempt);
 }

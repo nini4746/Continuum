@@ -162,14 +162,8 @@ public class WorkflowEngine {
         try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 
-    @Transactional
     public boolean recordDuplicateForReplayCheck(Long executionId, String stepId, int attempt) {
-        try {
-            stepRecords.saveAndFlush(new StepRecord(executionId, stepId, StepStatus.SUCCEEDED, attempt, "replay-attempt"));
-            return false;
-        } catch (DataIntegrityViolationException dup) {
-            return true;
-        }
+        return stepRecords.existsByExecutionIdAndStepIdAndAttempt(executionId, stepId, attempt);
     }
 
     public void resumeAll() {

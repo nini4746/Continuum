@@ -1,0 +1,4 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: ${CONTINUUM_DDL_AUTO:update}

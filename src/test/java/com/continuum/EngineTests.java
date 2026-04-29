@@ -27,7 +27,8 @@ import static org.junit.jupiter.api.Assertions.*;
 @DirtiesContext(classMode = ClassMode.BEFORE_EACH_TEST_METHOD)
 @TestPropertySource(properties = {
         "spring.datasource.url=jdbc:h2:mem:cont_${random.uuid};DB_CLOSE_DELAY=-1",
-        "spring.jpa.hibernate.ddl-auto=create-drop"
+        "spring.jpa.hibernate.ddl-auto=create-drop",
+        "continuum.errors.expose-raw-messages=false"
 })
 class EngineTests {
 
@@ -113,6 +114,23 @@ class EngineTests {
         Execution after = executions.findById(e.getId()).orElseThrow();
         assertEquals(ExecutionStatus.COMPLETED, after.getStatus());
         assertEquals(3, handlers.counter("cr"));
+    }
+
+    @Test
+    void failed_step_records_sanitized_error_class_only() {
+        engine.register(new WorkflowDef("err", List.of(
+                step("s1", "fail", Map.of("reason", "secret-internal-detail"),
+                        new RetryPolicy(1, 0, 1.0), OnFailure.ABORT)
+        )));
+        Execution e = engine.start("err");
+        engine.run(e.getId());
+        var failedRecords = stepRecords.findByExecutionIdOrderByCreatedAtAsc(e.getId()).stream()
+                .filter(r -> r.getStatus().name().equals("FAILED")).toList();
+        assertFalse(failedRecords.isEmpty());
+        String msg = failedRecords.get(0).getMessage();
+        assertNotNull(msg);
+        assertFalse(msg.contains("secret-internal-detail"),
+                "sanitized error must not leak internal message: " + msg);
     }
 
     @Test

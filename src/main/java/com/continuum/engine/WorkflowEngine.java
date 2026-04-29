@@ -36,17 +36,25 @@ public class WorkflowEngine {
     private final HandlerRegistry handlers;
     private final ObjectMapper om;
     private final int workerThreads;
+    private final boolean exposeRawErrors;
     private ExecutorService asyncWorker;
 
     public WorkflowEngine(WorkflowRepo workflows, ExecutionRepo executions,
                           StepRecordRepo stepRecords, HandlerRegistry handlers, ObjectMapper om,
-                          @Value("${continuum.async.threads:4}") int workerThreads) {
+                          @Value("${continuum.async.threads:4}") int workerThreads,
+                          @Value("${continuum.errors.expose-raw-messages:false}") boolean exposeRawErrors) {
         this.workflows = workflows;
         this.executions = executions;
         this.stepRecords = stepRecords;
         this.handlers = handlers;
         this.om = om;
         this.workerThreads = Math.max(1, workerThreads);
+        this.exposeRawErrors = exposeRawErrors;
+    }
+
+    private String sanitizeError(Exception ex) {
+        if (exposeRawErrors) return ex.getMessage();
+        return ex.getClass().getSimpleName();
     }
 
     @PostConstruct
@@ -153,7 +161,9 @@ public class WorkflowEngine {
                 e.advanceCursor();
                 return;
             } catch (Exception ex) {
-                lastError = ex.getMessage();
+                lastError = sanitizeError(ex);
+                log.warn("step failed exec={} step={} attempt={} cause={}",
+                        e.getId(), stepDef.id(), attempt, ex.getClass().getSimpleName());
                 try {
                     stepRecords.saveAndFlush(
                             new StepRecord(e.getId(), stepDef.id(), StepStatus.FAILED, attempt, lastError));
@@ -193,7 +203,7 @@ public class WorkflowEngine {
                         StepStatus.COMPENSATED, 0, "compensated"));
             } catch (Exception ex) {
                 stepRecords.save(new StepRecord(e.getId(), s.id() + "#compensate",
-                        StepStatus.FAILED, 0, "compensate failed: " + ex.getMessage()));
+                        StepStatus.FAILED, 0, "compensate failed: " + sanitizeError(ex)));
             }
         }
         e.markStatus(ExecutionStatus.COMPENSATED);

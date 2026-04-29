@@ -1,12 +1,24 @@
 spring:
   datasource:
-    url: jdbc:h2:file:./data/continuum;AUTO_SERVER=TRUE
-    username: sa
-    password: ""
+    url: ${DB_URL:jdbc:h2:file:./data/continuum;AUTO_SERVER=TRUE}
+    username: ${DB_USERNAME:sa}
+    password: ${DB_PASSWORD:}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: ${CONTINUUM_DDL_AUTO:none}
     open-in-view: false
 
 server:
-  port: 8090
+  port: ${SERVER_PORT:8090}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+
+continuum:
+  async:
+    threads: ${CONTINUUM_ASYNC_THREADS:4}
+  errors:
+    expose-raw-messages: ${CONTINUUM_EXPOSE_RAW_ERRORS:false}

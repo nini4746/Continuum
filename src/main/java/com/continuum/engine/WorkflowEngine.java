@@ -37,6 +37,7 @@ public class WorkflowEngine {
     private final StepRecordRepo stepRecords;
     private final HandlerRegistry handlers;
     private final ObjectMapper om;
+    private final RetryStrategy retryStrategy;
     private final int workerThreads;
     private final boolean exposeRawErrors;
     private ExecutorService asyncWorker;
@@ -46,6 +47,7 @@ public class WorkflowEngine {
 
     public WorkflowEngine(WorkflowRepo workflows, ExecutionRepo executions,
                           StepRecordRepo stepRecords, HandlerRegistry handlers, ObjectMapper om,
+                          RetryStrategy retryStrategy,
                           @Value("${continuum.async.threads:4}") int workerThreads,
                           @Value("${continuum.errors.expose-raw-messages:false}") boolean exposeRawErrors) {
         this.workflows = workflows;
@@ -53,6 +55,7 @@ public class WorkflowEngine {
         this.stepRecords = stepRecords;
         this.handlers = handlers;
         this.om = om;
+        this.retryStrategy = retryStrategy;
         this.workerThreads = Math.max(1, workerThreads);
         this.exposeRawErrors = exposeRawErrors;
     }
@@ -172,6 +175,7 @@ public class WorkflowEngine {
         var handler = handlers.require(stepDef.type());
         int max = Math.max(1, stepDef.retry().maxAttempts());
         String lastError = null;
+        Throwable lastThrown = null;
         for (int attempt = 1; attempt <= max; attempt++) {
             try {
                 handler.execute(stepDef.inputs());
@@ -187,6 +191,7 @@ public class WorkflowEngine {
                 return;
             } catch (Exception ex) {
                 lastError = sanitizeError(ex);
+                lastThrown = ex;
                 log.warn("step failed exec={} step={} attempt={} cause={}",
                         e.getId(), stepDef.id(), attempt, ex.getClass().getSimpleName());
                 try {
@@ -195,10 +200,9 @@ public class WorkflowEngine {
                 } catch (DataIntegrityViolationException ignore) {
                     // already recorded; safe to continue
                 }
-                if (attempt < max) {
-                    long backoff = stepDef.retry().backoffFor(attempt + 1);
-                    if (backoff > 0) sleepQuiet(backoff);
-                }
+                if (!retryStrategy.shouldRetry(stepDef.retry(), attempt, lastThrown)) break;
+                long backoff = retryStrategy.backoffMillis(stepDef.retry(), attempt + 1);
+                if (backoff > 0) sleepQuiet(backoff);
             }
         }
         handleTerminalFailure(e, stepDef, lastError == null ? "unknown" : lastError);

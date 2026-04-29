@@ -146,6 +146,23 @@ class EngineTests {
     }
 
     @Test
+    void concurrent_run_calls_on_same_execution_do_not_interleave() throws Exception {
+        engine.register(new WorkflowDef("conc", List.of(
+                step("s1", "count", Map.of("key", "conc"), RetryPolicy.none(), OnFailure.ABORT),
+                step("s2", "count", Map.of("key", "conc"), RetryPolicy.none(), OnFailure.ABORT),
+                step("s3", "count", Map.of("key", "conc"), RetryPolicy.none(), OnFailure.ABORT)
+        )));
+        Execution e = engine.start("conc");
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(4);
+        java.util.List<java.util.concurrent.Future<ExecutionStatus>> fs = new java.util.ArrayList<>();
+        for (int i = 0; i < 4; i++) fs.add(pool.submit(() -> engine.run(e.getId())));
+        for (var f : fs) f.get(10, java.util.concurrent.TimeUnit.SECONDS);
+        pool.shutdown();
+        // each step ran exactly once (no double execution under concurrent run() calls)
+        assertEquals(3, handlers.counter("conc"));
+    }
+
+    @Test
     void duplicate_attempt_record_is_rejected() {
         engine.register(new WorkflowDef("idem", List.of(
                 step("only", "count", Map.of("key", "idem"), RetryPolicy.none(), OnFailure.ABORT)

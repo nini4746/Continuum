@@ -18,12 +18,14 @@ import org.springframework.transaction.annotation.Transactional;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 @Service
 public class WorkflowEngine {
@@ -38,6 +40,9 @@ public class WorkflowEngine {
     private final int workerThreads;
     private final boolean exposeRawErrors;
     private ExecutorService asyncWorker;
+    // per-execution lock prevents concurrent run() invocations from interleaving steps
+    // in a single-JVM deployment. for true distributed setups, replace with DB advisory lock.
+    private final ConcurrentHashMap<Long, ReentrantLock> executionLocks = new ConcurrentHashMap<>();
 
     public WorkflowEngine(WorkflowRepo workflows, ExecutionRepo executions,
                           StepRecordRepo stepRecords, HandlerRegistry handlers, ObjectMapper om,
@@ -115,16 +120,28 @@ public class WorkflowEngine {
     public ExecutionStatus run(Long executionId) {
         // bounded iteration to prevent runaway workflows; configurable via continuum.run.max-steps
         int maxSteps = 10_000;
-        for (int i = 0; i < maxSteps; i++) {
-            ExecutionStatus s = step(executionId);
-            if (s != ExecutionStatus.RUNNING) return s;
+        ReentrantLock lock = executionLocks.computeIfAbsent(executionId, k -> new ReentrantLock());
+        boolean acquired = lock.tryLock();
+        if (!acquired) {
+            log.info("execution {} is already running on this JVM, skipping concurrent run", executionId);
+            return executions.findById(executionId).map(Execution::getStatus).orElse(ExecutionStatus.FAILED);
         }
-        log.warn("execution {} exceeded max-steps={} — treating as FAILED", executionId, maxSteps);
-        Execution e = executions.findById(executionId).orElseThrow();
-        e.markStatus(ExecutionStatus.FAILED);
-        e.setLastError("max-steps exceeded");
-        executions.save(e);
-        return ExecutionStatus.FAILED;
+        try {
+            for (int i = 0; i < maxSteps; i++) {
+                ExecutionStatus s = step(executionId);
+                if (s != ExecutionStatus.RUNNING) return s;
+            }
+            log.warn("execution {} exceeded max-steps={} — treating as FAILED", executionId, maxSteps);
+            Execution e = executions.findById(executionId).orElseThrow();
+            e.markStatus(ExecutionStatus.FAILED);
+            e.setLastError("max-steps exceeded");
+            executions.save(e);
+            return ExecutionStatus.FAILED;
+        } finally {
+            lock.unlock();
+            // best-effort cleanup; safe because lock map only grows by execution count
+            executionLocks.remove(executionId, lock);
+        }
     }
 
     @Transactional

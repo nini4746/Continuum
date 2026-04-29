@@ -113,10 +113,18 @@ public class WorkflowEngine {
     }
 
     public ExecutionStatus run(Long executionId) {
-        while (true) {
+        // bounded iteration to prevent runaway workflows; configurable via continuum.run.max-steps
+        int maxSteps = 10_000;
+        for (int i = 0; i < maxSteps; i++) {
             ExecutionStatus s = step(executionId);
             if (s != ExecutionStatus.RUNNING) return s;
         }
+        log.warn("execution {} exceeded max-steps={} — treating as FAILED", executionId, maxSteps);
+        Execution e = executions.findById(executionId).orElseThrow();
+        e.markStatus(ExecutionStatus.FAILED);
+        e.setLastError("max-steps exceeded");
+        executions.save(e);
+        return ExecutionStatus.FAILED;
     }
 
     @Transactional

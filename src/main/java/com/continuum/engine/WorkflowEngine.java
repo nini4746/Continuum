@@ -11,9 +11,19 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class WorkflowEngine {
@@ -25,14 +35,45 @@ public class WorkflowEngine {
     private final StepRecordRepo stepRecords;
     private final HandlerRegistry handlers;
     private final ObjectMapper om;
+    private final int workerThreads;
+    private ExecutorService asyncWorker;
 
     public WorkflowEngine(WorkflowRepo workflows, ExecutionRepo executions,
-                          StepRecordRepo stepRecords, HandlerRegistry handlers, ObjectMapper om) {
+                          StepRecordRepo stepRecords, HandlerRegistry handlers, ObjectMapper om,
+                          @Value("${continuum.async.threads:4}") int workerThreads) {
         this.workflows = workflows;
         this.executions = executions;
         this.stepRecords = stepRecords;
         this.handlers = handlers;
         this.om = om;
+        this.workerThreads = Math.max(1, workerThreads);
+    }
+
+    @PostConstruct
+    void initWorker() {
+        AtomicInteger seq = new AtomicInteger();
+        ThreadFactory factory = r -> {
+            Thread t = new Thread(r, "continuum-worker-" + seq.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+        this.asyncWorker = Executors.newFixedThreadPool(workerThreads, factory);
+    }
+
+    @PreDestroy
+    void shutdownWorker() {
+        if (asyncWorker == null) return;
+        asyncWorker.shutdown();
+        try {
+            if (!asyncWorker.awaitTermination(5, TimeUnit.SECONDS)) asyncWorker.shutdownNow();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            asyncWorker.shutdownNow();
+        }
+    }
+
+    public Future<ExecutionStatus> runAsync(Long executionId) {
+        return asyncWorker.submit(() -> run(executionId));
     }
 
     @Transactional

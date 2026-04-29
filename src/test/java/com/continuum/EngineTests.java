@@ -116,6 +116,18 @@ class EngineTests {
     }
 
     @Test
+    void async_run_completes_independently() throws Exception {
+        engine.register(new WorkflowDef("async", List.of(
+                step("s1", "count", Map.of("key", "async"), RetryPolicy.none(), OnFailure.ABORT),
+                step("s2", "count", Map.of("key", "async"), RetryPolicy.none(), OnFailure.ABORT)
+        )));
+        Execution e = engine.start("async");
+        ExecutionStatus result = engine.runAsync(e.getId()).get(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals(ExecutionStatus.COMPLETED, result);
+        assertEquals(2, handlers.counter("async"));
+    }
+
+    @Test
     void duplicate_attempt_record_is_rejected() {
         engine.register(new WorkflowDef("idem", List.of(
                 step("only", "count", Map.of("key", "idem"), RetryPolicy.none(), OnFailure.ABORT)

@@ -13,6 +13,9 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @RestController
 public class WorkflowController {
@@ -45,6 +48,46 @@ public class WorkflowController {
                 "status", after.getStatus().name(),
                 "cursor", after.getCursor()
         ));
+    }
+
+    @PostMapping("/executions/async")
+    public ResponseEntity<Map<String, Object>> startAsync(@RequestBody Map<String, String> body) {
+        String name = body.get("workflow");
+        if (name == null) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "workflow required");
+        Execution e = engine.start(name);
+        var future = engine.runAsync(e.getId());
+        long waitMs = parseWaitMs(body.get("waitMs"));
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("id", e.getId());
+        if (waitMs > 0) {
+            try {
+                future.get(waitMs, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException te) {
+                resp.put("status", "RUNNING");
+                resp.put("note", "still running after " + waitMs + "ms");
+                return ResponseEntity.status(HttpStatus.ACCEPTED).body(resp);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "interrupted");
+            } catch (ExecutionException ee) {
+                throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                        "async execution failed: " + ee.getCause().getMessage());
+            }
+        }
+        Execution after = executions.findById(e.getId()).orElseThrow();
+        resp.put("status", after.getStatus().name());
+        resp.put("cursor", after.getCursor());
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(resp);
+    }
+
+    private static long parseWaitMs(String raw) {
+        if (raw == null || raw.isBlank()) return 0;
+        try {
+            long v = Long.parseLong(raw);
+            return Math.max(0, Math.min(v, 30_000));
+        } catch (NumberFormatException nfe) {
+            return 0;
+        }
     }
 
     @GetMapping("/executions/{id}")

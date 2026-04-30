@@ -70,11 +70,25 @@ curl localhost:8090/executions/1
 | `concurrent_run_calls_on_same_execution_do_not_interleave` | 같은 execution에 동시 `run()` 호출 직렬화 |
 | `duplicate_attempt_record_is_rejected` | 이미 SUCCEEDED된 (exec, step, attempt=1) 재기록은 unique 제약으로 거부 |
 
-`mvn test` → 8/8 pass.
+`mvn test` → 20/20 pass.
+
+DAG/락 추가 테스트(`DagEngineTests`, `DistributedLockTests`):
+- 사이클/unknown 의존 거부, diamond DAG happy path, 병렬 분기, ABORT 시 후속 step 미실행, COMPENSATE 시 역위상 unwind, 순차 워크플로의 sequential path 보존 (DAG 6건)
+- 단일 holder 진입/해제, 경합 시 timeout, 잘못된 token unlock no-op, 다중 키 독립성, 8 thread × 300회 mutual exclusion (락 5건)
 
 ## 의도적으로 보류한 항목
 
 - 비동기 실행(스케줄러), 큐 기반 디스패치
-- DAG 분기/병렬 (현 MVP는 순차 리스트)
-- 클러스터 동시 실행 시 분산 락
 - 사용자 보안/RBAC, JWT
+- 외부 분산 락 backend 통합 (Redis/etcd) — 추상화는 완료, 실제 어댑터는 미포함
+
+## DAG / 병렬 실행
+
+`StepDef`에 `dependsOn` 필드(없으면 빈 배열, 순차 모드 유지). `WorkflowDef`는 등록 시점에 unknown reference + cycle을 동시에 검증한다. 한 step이라도 dependsOn을 가지면 엔진은 DAG 모드로 진입:
+- 의존이 모두 SUCCEEDED인 step을 동시 dispatch
+- 별도 `dagStepWorker` 풀 사용 (asyncWorker가 DAG 호출 thread를 들고 있을 때 deadlock 방지)
+- 실패 시 ABORT/COMPENSATE/SKIP 의미는 동일 — COMPENSATE는 위상 정렬 역순으로 unwind
+
+## 분산 락 추상화
+
+`DistributedLock` 인터페이스 + `InProcessDistributedLock` 기본 구현(단일 JVM). `tryLock(key, timeout, unit) -> Token`, `unlock(key, token)`. 실제 분산 환경에선 동일 인터페이스를 만족하는 다른 빈을 등록(예: Redis/Lettuce 기반)하면 엔진 변경 없이 갈아끼울 수 있다. 워크플로 실행은 `execution:{id}` 키로 락을 잡으며, `continuum.lock.timeout-ms` 로 대기 시간 설정.

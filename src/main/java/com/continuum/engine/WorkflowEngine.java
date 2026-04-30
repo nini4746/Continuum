@@ -18,14 +18,21 @@ import org.springframework.transaction.annotation.Transactional;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletionService;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantLock;
 
 @Service
 public class WorkflowEngine {
@@ -38,17 +45,19 @@ public class WorkflowEngine {
     private final HandlerRegistry handlers;
     private final ObjectMapper om;
     private final RetryStrategy retryStrategy;
+    private final DistributedLock distributedLock;
+    private final long lockTimeoutMs;
     private final int workerThreads;
     private final boolean exposeRawErrors;
     private ExecutorService asyncWorker;
-    // per-execution lock prevents concurrent run() invocations from interleaving steps
-    // in a single-JVM deployment. for true distributed setups, replace with DB advisory lock.
-    private final ConcurrentHashMap<Long, ReentrantLock> executionLocks = new ConcurrentHashMap<>();
+    private ExecutorService dagStepWorker;
 
     public WorkflowEngine(WorkflowRepo workflows, ExecutionRepo executions,
                           StepRecordRepo stepRecords, HandlerRegistry handlers, ObjectMapper om,
                           RetryStrategy retryStrategy,
+                          DistributedLock distributedLock,
                           @Value("${continuum.async.threads:4}") int workerThreads,
+                          @Value("${continuum.lock.timeout-ms:50}") long lockTimeoutMs,
                           @Value("${continuum.errors.expose-raw-messages:false}") boolean exposeRawErrors) {
         this.workflows = workflows;
         this.executions = executions;
@@ -56,8 +65,14 @@ public class WorkflowEngine {
         this.handlers = handlers;
         this.om = om;
         this.retryStrategy = retryStrategy;
+        this.distributedLock = distributedLock;
         this.workerThreads = Math.max(1, workerThreads);
+        this.lockTimeoutMs = Math.max(0, lockTimeoutMs);
         this.exposeRawErrors = exposeRawErrors;
+    }
+
+    private static String executionLockKey(Long executionId) {
+        return "execution:" + executionId;
     }
 
     private String sanitizeError(Exception ex) {
@@ -74,17 +89,28 @@ public class WorkflowEngine {
             return t;
         };
         this.asyncWorker = Executors.newFixedThreadPool(workerThreads, factory);
+        AtomicInteger dagSeq = new AtomicInteger();
+        ThreadFactory dagFactory = r -> {
+            Thread t = new Thread(r, "continuum-dag-" + dagSeq.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+        // separate pool so DAG step parallelism never deadlocks against an asyncWorker
+        // thread that's blocked waiting for child steps to complete.
+        this.dagStepWorker = Executors.newFixedThreadPool(workerThreads, dagFactory);
     }
 
     @PreDestroy
     void shutdownWorker() {
-        if (asyncWorker == null) return;
-        asyncWorker.shutdown();
-        try {
-            if (!asyncWorker.awaitTermination(5, TimeUnit.SECONDS)) asyncWorker.shutdownNow();
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            asyncWorker.shutdownNow();
+        for (ExecutorService es : new ExecutorService[]{asyncWorker, dagStepWorker}) {
+            if (es == null) continue;
+            es.shutdown();
+            try {
+                if (!es.awaitTermination(5, TimeUnit.SECONDS)) es.shutdownNow();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                es.shutdownNow();
+            }
         }
     }
 
@@ -123,28 +149,212 @@ public class WorkflowEngine {
     public ExecutionStatus run(Long executionId) {
         // bounded iteration to prevent runaway workflows; configurable via continuum.run.max-steps
         int maxSteps = 10_000;
-        ReentrantLock lock = executionLocks.computeIfAbsent(executionId, k -> new ReentrantLock());
-        boolean acquired = lock.tryLock();
-        if (!acquired) {
-            log.info("execution {} is already running on this JVM, skipping concurrent run", executionId);
+        String lockKey = executionLockKey(executionId);
+        DistributedLock.Token token = distributedLock.tryLock(lockKey, lockTimeoutMs, TimeUnit.MILLISECONDS);
+        if (token == null) {
+            log.info("execution {} is already running, skipping concurrent run", executionId);
             return executions.findById(executionId).map(Execution::getStatus).orElse(ExecutionStatus.FAILED);
         }
         try {
+            // Route to DAG mode if any step declares deps; otherwise stay sequential.
+            Execution e = executions.findById(executionId).orElseThrow();
+            WorkflowDef def = defOf(e);
+            if (def.hasDependencies()) {
+                return runDag(executionId, def);
+            }
             for (int i = 0; i < maxSteps; i++) {
                 ExecutionStatus s = step(executionId);
                 if (s != ExecutionStatus.RUNNING) return s;
             }
             log.warn("execution {} exceeded max-steps={} — treating as FAILED", executionId, maxSteps);
-            Execution e = executions.findById(executionId).orElseThrow();
-            e.markStatus(ExecutionStatus.FAILED);
-            e.setLastError("max-steps exceeded");
-            executions.save(e);
+            Execution exec = executions.findById(executionId).orElseThrow();
+            exec.markStatus(ExecutionStatus.FAILED);
+            exec.setLastError("max-steps exceeded");
+            executions.save(exec);
             return ExecutionStatus.FAILED;
         } finally {
-            lock.unlock();
-            // best-effort cleanup; safe because lock map only grows by execution count
-            executionLocks.remove(executionId, lock);
+            distributedLock.unlock(lockKey, token);
         }
+    }
+
+    /**
+     * DAG execution: schedule steps whose {@code dependsOn} are all satisfied. Independent
+     * branches run concurrently on the async worker pool. Failures still honour
+     * {@link OnFailure} semantics — ABORT halts scheduling, COMPENSATE triggers reverse
+     * compensation across already-succeeded steps.
+     */
+    private ExecutionStatus runDag(Long executionId, WorkflowDef def) {
+        Execution e = executions.findById(executionId).orElseThrow();
+        if (e.getStatus() == ExecutionStatus.PENDING) {
+            e.markStatus(ExecutionStatus.RUNNING);
+            executions.save(e);
+        }
+
+        Map<String, StepDef> stepById = new HashMap<>();
+        Map<String, Set<String>> remainingDeps = new HashMap<>();
+        for (StepDef s : def.steps()) {
+            stepById.put(s.id(), s);
+            remainingDeps.put(s.id(), new HashSet<>(s.dependsOn()));
+        }
+        // honour any prior completed records (idempotent re-run after restart)
+        Set<String> done = new HashSet<>();
+        for (StepRecord r : stepRecords.findByExecutionIdOrderByCreatedAtAsc(executionId)) {
+            if (r.getStatus() == StepStatus.SUCCEEDED) done.add(r.getStepId());
+        }
+        // remove satisfied deps from in-flight tracker
+        for (String d : done) {
+            for (Set<String> deps : remainingDeps.values()) deps.remove(d);
+            remainingDeps.remove(d);
+        }
+
+        CompletionService<DagResult> cs = new ExecutorCompletionService<>(dagStepWorker);
+        Set<String> running = new HashSet<>();
+        boolean abort = false;
+        boolean compensate = false;
+        String terminalError = null;
+
+        try {
+            while (!remainingDeps.isEmpty() || !running.isEmpty()) {
+                // schedule all currently ready steps
+                if (!abort) {
+                    List<String> ready = new ArrayList<>();
+                    for (var entry : remainingDeps.entrySet()) {
+                        if (entry.getValue().isEmpty() && !running.contains(entry.getKey())) {
+                            ready.add(entry.getKey());
+                        }
+                    }
+                    for (String id : ready) {
+                        running.add(id);
+                        StepDef s = stepById.get(id);
+                        cs.submit(() -> attemptStepDag(executionId, s));
+                    }
+                    if (running.isEmpty() && !ready.isEmpty()) break; // safety
+                    if (running.isEmpty()) break; // nothing scheduled and nothing running -> done
+                }
+                if (running.isEmpty()) break;
+
+                Future<DagResult> finished = cs.take();
+                DagResult r = finished.get();
+                running.remove(r.stepId);
+                if (r.success) {
+                    done.add(r.stepId);
+                    remainingDeps.remove(r.stepId);
+                    for (Set<String> deps : remainingDeps.values()) deps.remove(r.stepId);
+                } else {
+                    terminalError = r.errorMessage;
+                    StepDef failedStep = stepById.get(r.stepId);
+                    switch (failedStep.onFailure()) {
+                        case SKIP -> {
+                            done.add(r.stepId);
+                            remainingDeps.remove(r.stepId);
+                            for (Set<String> deps : remainingDeps.values()) deps.remove(r.stepId);
+                        }
+                        case ABORT -> abort = true;
+                        case COMPENSATE -> { abort = true; compensate = true; }
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            log.error("DAG execution {} failed unexpectedly: {}", executionId, ex.toString());
+            abort = true;
+            terminalError = sanitizeError(ex);
+        }
+
+        Execution latest = executions.findById(executionId).orElseThrow();
+        latest.setLastError(terminalError);
+        if (abort) {
+            latest.markStatus(ExecutionStatus.FAILED);
+            executions.save(latest);
+            if (compensate) {
+                compensateDag(latest, def, done);
+            }
+            return latest.getStatus();
+        }
+        latest.markStatus(ExecutionStatus.COMPLETED);
+        executions.save(latest);
+        return ExecutionStatus.COMPLETED;
+    }
+
+    private record DagResult(String stepId, boolean success, String errorMessage) {}
+
+    /**
+     * Run a single DAG step with retry semantics. Mirrors the sequential path but does
+     * not advance the execution cursor (cursor is meaningless under DAG ordering).
+     */
+    private DagResult attemptStepDag(Long executionId, StepDef stepDef) {
+        var handler = handlers.require(stepDef.type());
+        int max = Math.max(1, stepDef.retry().maxAttempts());
+        String lastError = null;
+        Throwable lastThrown = null;
+        for (int attempt = 1; attempt <= max; attempt++) {
+            try {
+                handler.execute(stepDef.inputs());
+                stepRecords.saveAndFlush(
+                        new StepRecord(executionId, stepDef.id(), StepStatus.SUCCEEDED, attempt, null));
+                return new DagResult(stepDef.id(), true, null);
+            } catch (DataIntegrityViolationException dup) {
+                log.warn("duplicate dag step record exec={} step={} attempt={}", executionId, stepDef.id(), attempt);
+                return new DagResult(stepDef.id(), true, null);
+            } catch (Exception ex) {
+                lastError = sanitizeError(ex);
+                lastThrown = ex;
+                try {
+                    stepRecords.saveAndFlush(
+                            new StepRecord(executionId, stepDef.id(), StepStatus.FAILED, attempt, lastError));
+                } catch (DataIntegrityViolationException ignore) { /* duplicate, ok */ }
+                if (!retryStrategy.shouldRetry(stepDef.retry(), attempt, lastThrown)) break;
+                long backoff = retryStrategy.backoffMillis(stepDef.retry(), attempt + 1);
+                if (backoff > 0) sleepQuiet(backoff);
+            }
+        }
+        return new DagResult(stepDef.id(), false, lastError == null ? "unknown" : lastError);
+    }
+
+    private void compensateDag(Execution e, WorkflowDef def, Set<String> succeededIds) {
+        // walk the topological order in reverse and compensate succeeded steps
+        List<StepDef> order = topologicalOrder(def);
+        for (int i = order.size() - 1; i >= 0; i--) {
+            StepDef s = order.get(i);
+            if (!succeededIds.contains(s.id())) continue;
+            if (s.compensateType() == null || s.compensateType().isBlank()) continue;
+            var h = handlers.require(s.compensateType());
+            try {
+                h.execute(s.compensateInputs());
+                stepRecords.save(new StepRecord(e.getId(), s.id() + "#compensate",
+                        StepStatus.COMPENSATED, 0, "compensated"));
+            } catch (Exception ex) {
+                stepRecords.save(new StepRecord(e.getId(), s.id() + "#compensate",
+                        StepStatus.FAILED, 0, "compensate failed: " + sanitizeError(ex)));
+            }
+        }
+        e.markStatus(ExecutionStatus.COMPENSATED);
+        executions.save(e);
+    }
+
+    private static List<StepDef> topologicalOrder(WorkflowDef def) {
+        Map<String, Integer> indeg = new HashMap<>();
+        Map<String, List<String>> adj = new HashMap<>();
+        Map<String, StepDef> byId = new HashMap<>();
+        for (StepDef s : def.steps()) {
+            byId.put(s.id(), s);
+            indeg.putIfAbsent(s.id(), 0);
+            for (String d : s.dependsOn()) {
+                adj.computeIfAbsent(d, k -> new ArrayList<>()).add(s.id());
+                indeg.merge(s.id(), 1, Integer::sum);
+            }
+        }
+        java.util.Deque<String> queue = new java.util.ArrayDeque<>();
+        for (var e : indeg.entrySet()) if (e.getValue() == 0) queue.add(e.getKey());
+        List<StepDef> out = new ArrayList<>();
+        while (!queue.isEmpty()) {
+            String cur = queue.poll();
+            out.add(byId.get(cur));
+            for (String nxt : adj.getOrDefault(cur, List.of())) {
+                indeg.merge(nxt, -1, Integer::sum);
+                if (indeg.get(nxt) == 0) queue.add(nxt);
+            }
+        }
+        return out;
     }
 
     @Transactional

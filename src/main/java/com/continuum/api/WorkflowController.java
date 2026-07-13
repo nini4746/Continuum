@@ -70,8 +70,10 @@ public class WorkflowController {
                 Thread.currentThread().interrupt();
                 throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "interrupted");
             } catch (ExecutionException ee) {
+                // Do not leak raw exception text to clients; the engine already stores
+                // a sanitized error on the execution record.
                 throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
-                        "async execution failed: " + ee.getCause().getMessage());
+                        "async execution failed; see GET /api/executions/" + e.getId());
             }
         }
         Execution after = executions.findById(e.getId()).orElseThrow();

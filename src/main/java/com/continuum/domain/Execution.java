@@ -14,6 +14,10 @@ public class Execution {
     @Column(nullable = false)
     private Long workflowId;
 
+    /** Workflow version pinned at start time; the execution never sees later edits (spec §3.1.2). */
+    @Column(nullable = false)
+    private int workflowVersion;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private ExecutionStatus status;
@@ -33,7 +37,12 @@ public class Execution {
     protected Execution() {}
 
     public Execution(Long workflowId) {
+        this(workflowId, 1);
+    }
+
+    public Execution(Long workflowId, int workflowVersion) {
         this.workflowId = workflowId;
+        this.workflowVersion = workflowVersion;
         this.status = ExecutionStatus.CREATED;
         this.cursor = 0;
         this.createdAt = Instant.now();
@@ -42,6 +51,7 @@ public class Execution {
 
     public Long getId() { return id; }
     public Long getWorkflowId() { return workflowId; }
+    public int getWorkflowVersion() { return workflowVersion; }
     public ExecutionStatus getStatus() { return status; }
     public int getCursor() { return cursor; }
     public String getLastError() { return lastError; }

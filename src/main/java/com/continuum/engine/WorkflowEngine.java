@@ -118,22 +118,36 @@ public class WorkflowEngine {
         return asyncWorker.submit(() -> run(executionId));
     }
 
+    /**
+     * Register a workflow version (spec §3.1.2). An identical re-registration is
+     * idempotent (returns the latest version); any change creates a new version and
+     * preserves prior versions untouched.
+     */
     @Transactional
     public WorkflowEntity register(WorkflowDef def) {
-        return workflows.findByName(def.name()).orElseGet(() -> {
-            try {
-                return workflows.save(new WorkflowEntity(def.name(), om.writeValueAsString(def)));
-            } catch (JsonProcessingException e) {
-                throw new IllegalStateException("could not serialize workflow def", e);
+        var latest = workflows.findTopByNameOrderByVersionDesc(def.name());
+        int nextVersion = latest.map(w -> w.getVersion() + 1).orElse(1);
+        // Stamp the assigned version into the stored definition so DSL and store agree.
+        WorkflowDef stamped = new WorkflowDef(def.name(), def.workflowId(), nextVersion,
+                def.steps(), def.transitions(), def.failurePolicy());
+        try {
+            String json = om.writeValueAsString(stamped);
+            if (latest.isPresent() && latest.get().getDefinitionJson().equals(
+                    om.writeValueAsString(new WorkflowDef(def.name(), def.workflowId(),
+                            latest.get().getVersion(), def.steps(), def.transitions(), def.failurePolicy())))) {
+                return latest.get(); // no change -> no new version
             }
-        });
+            return workflows.save(new WorkflowEntity(def.name(), nextVersion, json));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("could not serialize workflow def", e);
+        }
     }
 
     @Transactional
     public Execution start(String workflowName) {
-        WorkflowEntity wf = workflows.findByName(workflowName)
+        WorkflowEntity wf = workflows.findTopByNameOrderByVersionDesc(workflowName)
                 .orElseThrow(() -> new IllegalArgumentException("unknown workflow: " + workflowName));
-        return executions.save(new Execution(wf.getId()));
+        return executions.save(new Execution(wf.getId(), wf.getVersion()));
     }
 
     public WorkflowDef defOf(Execution e) {

@@ -6,6 +6,7 @@ import com.continuum.dto.WorkflowDef;
 import com.continuum.engine.WorkflowEngine;
 import com.continuum.repo.ExecutionRepo;
 import com.continuum.repo.StepRecordRepo;
+import com.continuum.repo.WorkflowRepo;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -23,17 +24,29 @@ public class WorkflowController {
     private final WorkflowEngine engine;
     private final ExecutionRepo executions;
     private final StepRecordRepo stepRecords;
+    private final WorkflowRepo workflows;
 
-    public WorkflowController(WorkflowEngine engine, ExecutionRepo executions, StepRecordRepo stepRecords) {
+    public WorkflowController(WorkflowEngine engine, ExecutionRepo executions,
+                              StepRecordRepo stepRecords, WorkflowRepo workflows) {
         this.engine = engine;
         this.executions = executions;
         this.stepRecords = stepRecords;
+        this.workflows = workflows;
     }
 
     @PostMapping("/workflows")
     public ResponseEntity<Map<String, Object>> register(@RequestBody WorkflowDef def) {
         WorkflowEntity wf = engine.register(def);
-        return ResponseEntity.status(HttpStatus.CREATED).body(Map.of("id", wf.getId(), "name", wf.getName()));
+        return ResponseEntity.status(HttpStatus.CREATED).body(Map.of(
+                "id", wf.getId(), "name", wf.getName(), "version", wf.getVersion()));
+    }
+
+    @GetMapping("/workflows/{name}/versions")
+    public Map<String, Object> versions(@PathVariable String name) {
+        var history = workflows.findByNameOrderByVersionDesc(name);
+        if (history.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+        return Map.of("name", name, "versions", history.stream()
+                .map(w -> Map.of("id", w.getId(), "version", w.getVersion())).toList());
     }
 
     @PostMapping("/executions")
@@ -99,6 +112,7 @@ public class WorkflowController {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("id", e.getId());
         body.put("status", e.getStatus().name());
+        body.put("workflowVersion", e.getWorkflowVersion());
         body.put("cursor", e.getCursor());
         body.put("lastError", e.getLastError());
         body.put("history", stepRecords.findByExecutionIdOrderByCreatedAtAsc(e.getId()).stream()

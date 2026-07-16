@@ -76,11 +76,32 @@ DAG/락 추가 테스트(`DagEngineTests`, `DistributedLockTests`):
 - 사이클/unknown 의존 거부, diamond DAG happy path, 병렬 분기, ABORT 시 후속 step 미실행, COMPENSATE 시 역위상 unwind, 순차 워크플로의 sequential path 보존 (DAG 6건)
 - 단일 holder 진입/해제, 경합 시 timeout, 잘못된 token unlock no-op, 다중 키 독립성, 8 thread × 300회 mutual exclusion (락 5건)
 
-## 의도적으로 보류한 항목
+## 스펙 대비 구현 범위 (정직 고지)
 
-- 비동기 실행(스케줄러), 큐 기반 디스패치
+이 저장소는 원 스펙 `Continuum.md`의 **일부만** 구현한 상태다 (핵심 실행 엔진 ~50%). 아래는 스펙이 요구하지만 **아직 구현하지 않은** 항목이다. 이전 README는 이를 명시하지 않아 완성으로 오인될 수 있었다 — 아래로 갭을 명확히 한다.
+
+### 설계상 보류 (스펙 범위 밖으로 명시 결정)
+
+- 비동기 실행 스케줄러, 큐 기반 디스패치 (현재는 스레드풀 직접 실행)
 - 사용자 보안/RBAC, JWT
 - 외부 분산 락 backend 통합 (Redis/etcd) — 추상화는 완료, 실제 어댑터는 미포함
+
+### 스펙 요구인데 미구현 (미착수 — 후속 작업 필요)
+
+| 스펙 | 기능 | 현 상태 |
+|---|---|---|
+| §3.1.1 | `CONDITIONAL_STEP` (조건 분기 스텝) | 미구현 — 핸들러/DSL 없음 |
+| §3.1.1 | `HUMAN_APPROVAL_STEP` (수동 승인 스텝) | 미구현 — `WAITING` 상태·승인 API 없음 |
+| §3.1.1 | DSL `workflow_id` / `transitions` / 최상위 `failure_policy` | 미구현 — `WorkflowDef`는 `name`+`steps`만 |
+| §3.1.2 | 워크플로우 **버전 관리** (실행 중 정의 변경 격리, 이력 보존) | 미구현 — `WorkflowEntity`에 version 컬럼 없음 |
+| §3.2.1 | 실행 상태 `WAITING` / `CANCELED` | 미구현 — enum에 없음 |
+| §3.4 | 내부 이벤트 버스 (step 완료/실패/타임아웃 발행·구독) | 미구현 |
+| §3.5 | 정책·권한 엔진 (속성/시간/이력 조건 DSL, 무재시작 반영) | 미구현 — policy 패키지 없음 |
+| §3.6.1 | 감사 로그 (누가/언제/왜 상태 전이) | 미구현 — `StepRecord`에 actor/reason 필드 없음 |
+| §3.6.2 | Replay (과거 실행 흐름 재현) | 미구현 — 중복검사 훅만 있고 replay 없음 |
+| §3.7 | 관리자 기능 (강제 중단/스텝 재실행/강제 상태변경/dead 탐지/통계) | 미구현 — `WorkflowController`는 register/start/get 4개만 |
+
+> 전량 구현은 규모가 커서(대략 수 주) 별도 `명세→그릴링→/goal` 워크플로우로 진행해야 한다. 현재 구현된 부분(상태머신, 정확히-한-번, 크래시 복구, 재시도, 보상, DAG/병렬, 분산 락 추상화)은 위 "핵심 보장" + "DAG/병렬" + "분산 락" 섹션 기준으로 동작하고 테스트(20/20)로 검증된다.
 
 ## DAG / 병렬 실행
 

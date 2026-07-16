@@ -49,6 +49,7 @@ public class WorkflowEngine {
     private final ConditionEvaluator conditions;
     private final EventBus eventBus;
     private final AuditService audit;
+    private final PolicyEngine policyEngine;
     private final long lockTimeoutMs;
     private final int workerThreads;
     private final boolean exposeRawErrors;
@@ -62,6 +63,7 @@ public class WorkflowEngine {
                           ConditionEvaluator conditions,
                           EventBus eventBus,
                           AuditService audit,
+                          PolicyEngine policyEngine,
                           @Value("${continuum.async.threads:4}") int workerThreads,
                           @Value("${continuum.lock.timeout-ms:50}") long lockTimeoutMs,
                           @Value("${continuum.errors.expose-raw-messages:false}") boolean exposeRawErrors) {
@@ -75,6 +77,7 @@ public class WorkflowEngine {
         this.conditions = conditions;
         this.eventBus = eventBus;
         this.audit = audit;
+        this.policyEngine = policyEngine;
         this.workerThreads = Math.max(1, workerThreads);
         this.lockTimeoutMs = Math.max(0, lockTimeoutMs);
         this.exposeRawErrors = exposeRawErrors;
@@ -161,6 +164,11 @@ public class WorkflowEngine {
     public Execution start(String workflowName, Map<String, Object> context) {
         WorkflowEntity wf = workflows.findTopByNameOrderByVersionDesc(workflowName)
                 .orElseThrow(() -> new IllegalArgumentException("unknown workflow: " + workflowName));
+        // Runtime policy check (spec §3.5). Evaluated fresh every call so edits apply at once.
+        PolicyEngine.Decision decision = policyEngine.evaluate("start", policyContext(workflowName, context));
+        if (!decision.allowed()) {
+            throw new PolicyDeniedException(decision.reason());
+        }
         Execution e = new Execution(wf.getId(), wf.getVersion());
         if (context != null && !context.isEmpty()) {
             try {
@@ -182,6 +190,36 @@ public class WorkflowEngine {
         ExecutionStatus from = ex.getStatus();
         ex.markStatus(to);
         if (from != to) audit.record(ex.getId(), from, to, actor, reason);
+    }
+
+    /**
+     * Build the flattened policy context (spec §3.5.1): request data (nested maps
+     * flattened to dotted keys, e.g. user.role), the workflow name, wall-clock time,
+     * and simple execution history. Not role-based - just attributes to match on.
+     */
+    private Map<String, Object> policyContext(String workflowName, Map<String, Object> requestData) {
+        Map<String, Object> ctx = new HashMap<>();
+        flattenInto("", requestData, ctx);
+        ctx.put("workflow", workflowName);
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        ctx.put("time.hour", now.getHour());
+        ctx.put("time.dayOfWeek", now.getDayOfWeek().getValue()); // 1=Mon..7=Sun
+        ctx.put("history.total", executions.count());
+        return ctx;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void flattenInto(String prefix, Map<String, Object> src, Map<String, Object> out) {
+        if (src == null) return;
+        for (var entry : src.entrySet()) {
+            String key = prefix.isEmpty() ? entry.getKey() : prefix + "." + entry.getKey();
+            Object v = entry.getValue();
+            if (v instanceof Map<?, ?> m) {
+                flattenInto(key, (Map<String, Object>) m, out);
+            } else {
+                out.put(key, v);
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")

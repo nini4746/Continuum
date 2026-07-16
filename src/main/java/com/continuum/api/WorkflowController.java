@@ -66,7 +66,12 @@ public class WorkflowController {
         Object name = body.get("workflow");
         if (name == null) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "workflow required");
         Map<String, Object> ctx = body.get("context") instanceof Map<?, ?> m ? (Map<String, Object>) m : null;
-        Execution e = engine.start(String.valueOf(name), ctx);
+        Execution e;
+        try {
+            e = engine.start(String.valueOf(name), ctx);
+        } catch (com.continuum.engine.PolicyDeniedException denied) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, denied.getMessage());
+        }
         engine.run(e.getId());
         Execution after = executions.findById(e.getId()).orElseThrow();
         return ResponseEntity.status(HttpStatus.CREATED).body(Map.of(

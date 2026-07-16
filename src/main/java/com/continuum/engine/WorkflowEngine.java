@@ -46,6 +46,7 @@ public class WorkflowEngine {
     private final ObjectMapper om;
     private final RetryStrategy retryStrategy;
     private final DistributedLock distributedLock;
+    private final ConditionEvaluator conditions;
     private final long lockTimeoutMs;
     private final int workerThreads;
     private final boolean exposeRawErrors;
@@ -56,6 +57,7 @@ public class WorkflowEngine {
                           StepRecordRepo stepRecords, HandlerRegistry handlers, ObjectMapper om,
                           RetryStrategy retryStrategy,
                           DistributedLock distributedLock,
+                          ConditionEvaluator conditions,
                           @Value("${continuum.async.threads:4}") int workerThreads,
                           @Value("${continuum.lock.timeout-ms:50}") long lockTimeoutMs,
                           @Value("${continuum.errors.expose-raw-messages:false}") boolean exposeRawErrors) {
@@ -66,6 +68,7 @@ public class WorkflowEngine {
         this.om = om;
         this.retryStrategy = retryStrategy;
         this.distributedLock = distributedLock;
+        this.conditions = conditions;
         this.workerThreads = Math.max(1, workerThreads);
         this.lockTimeoutMs = Math.max(0, lockTimeoutMs);
         this.exposeRawErrors = exposeRawErrors;
@@ -145,9 +148,32 @@ public class WorkflowEngine {
 
     @Transactional
     public Execution start(String workflowName) {
+        return start(workflowName, null);
+    }
+
+    @Transactional
+    public Execution start(String workflowName, Map<String, Object> context) {
         WorkflowEntity wf = workflows.findTopByNameOrderByVersionDesc(workflowName)
                 .orElseThrow(() -> new IllegalArgumentException("unknown workflow: " + workflowName));
-        return executions.save(new Execution(wf.getId(), wf.getVersion()));
+        Execution e = new Execution(wf.getId(), wf.getVersion());
+        if (context != null && !context.isEmpty()) {
+            try {
+                e.setContextJson(om.writeValueAsString(context));
+            } catch (JsonProcessingException ex) {
+                throw new IllegalArgumentException("invalid execution context", ex);
+            }
+        }
+        return executions.save(e);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> contextOf(Execution e) {
+        if (e.getContextJson() == null || e.getContextJson().isBlank()) return new HashMap<>();
+        try {
+            return om.readValue(e.getContextJson(), Map.class);
+        } catch (JsonProcessingException ex) {
+            return new HashMap<>();
+        }
     }
 
     public WorkflowDef defOf(Execution e) {
@@ -392,12 +418,68 @@ public class WorkflowEngine {
             return ExecutionStatus.COMPLETED;
         }
         StepDef stepDef = def.steps().get(e.getCursor());
-        runOneStep(e, stepDef);
+        switch (stepDef.kind()) {
+            case CONDITIONAL -> handleConditional(e, def, stepDef);
+            default -> runOneStep(e, def, stepDef);
+        }
         executions.save(e);
         return e.getStatus();
     }
 
-    private void runOneStep(Execution e, StepDef stepDef) {
+    /**
+     * Move the cursor to the next step. When the workflow declares transitions the
+     * next step is the unconditional edge from {@code current} (no outgoing edge =
+     * leaf = complete); otherwise fall back to the linear cursor+1.
+     */
+    private void advanceTo(Execution e, WorkflowDef def, StepDef current) {
+        if (def.transitions().isEmpty()) {
+            e.advanceCursor();
+            return;
+        }
+        String target = def.transitions().stream()
+                .filter(t -> t.from().equals(current.id()) && (t.when() == null || t.when().isBlank()))
+                .map(com.continuum.dto.Transition::to)
+                .findFirst().orElse(null);
+        int idx = target == null ? def.steps().size() : indexOfStep(def, target);
+        e.setCursor(idx >= 0 ? idx : def.steps().size());
+    }
+
+    /**
+     * Evaluate a CONDITIONAL step against the execution context, record the outcome,
+     * and branch: follow the transition from this step whose {@code when} matches the
+     * boolean result ("true"/"false") by jumping the cursor to the target step; with
+     * no matching transition, fall through to the next step (cursor+1).
+     */
+    private void handleConditional(Execution e, WorkflowDef def, StepDef stepDef) {
+        boolean result = conditions.eval(stepDef.condition(), contextOf(e));
+        stepRecords.save(new StepRecord(e.getId(), stepDef.id(), StepStatus.SUCCEEDED, 1,
+                "condition '" + stepDef.condition() + "' = " + result));
+        String want = Boolean.toString(result);
+        String target = def.transitions().stream()
+                .filter(t -> t.from().equals(stepDef.id())
+                        && t.when() != null && t.when().equalsIgnoreCase(want))
+                .map(com.continuum.dto.Transition::to)
+                .findFirst().orElse(null);
+        if (target == null) {
+            e.advanceCursor();
+            return;
+        }
+        int idx = indexOfStep(def, target);
+        if (idx < 0) { // defensive: validated at register time, should not happen
+            e.advanceCursor();
+            return;
+        }
+        e.setCursor(idx);
+    }
+
+    private static int indexOfStep(WorkflowDef def, String stepId) {
+        for (int i = 0; i < def.steps().size(); i++) {
+            if (def.steps().get(i).id().equals(stepId)) return i;
+        }
+        return -1;
+    }
+
+    private void runOneStep(Execution e, WorkflowDef def, StepDef stepDef) {
         var handler = handlers.require(stepDef.type());
         int max = Math.max(1, stepDef.retry().maxAttempts());
         String lastError = null;
@@ -407,13 +489,13 @@ public class WorkflowEngine {
                 handler.execute(stepDef.inputs());
                 stepRecords.saveAndFlush(
                         new StepRecord(e.getId(), stepDef.id(), StepStatus.SUCCEEDED, attempt, null));
-                e.advanceCursor();
+                advanceTo(e, def, stepDef);
                 e.setLastError(null);
                 return;
             } catch (DataIntegrityViolationException dup) {
                 log.warn("duplicate step record rejected exec={} step={} attempt={}",
                         e.getId(), stepDef.id(), attempt);
-                e.advanceCursor();
+                advanceTo(e, def, stepDef);
                 return;
             } catch (Exception ex) {
                 lastError = sanitizeError(ex);
@@ -431,13 +513,13 @@ public class WorkflowEngine {
                 if (backoff > 0) sleepQuiet(backoff);
             }
         }
-        handleTerminalFailure(e, stepDef, lastError == null ? "unknown" : lastError);
+        handleTerminalFailure(e, def, stepDef, lastError == null ? "unknown" : lastError);
     }
 
-    private void handleTerminalFailure(Execution e, StepDef stepDef, String message) {
+    private void handleTerminalFailure(Execution e, WorkflowDef def, StepDef stepDef, String message) {
         e.setLastError(stepDef.id() + ": " + message);
-        switch (stepDef.effectiveOnFailure(defOf(e).failurePolicy())) {
-            case SKIP -> e.advanceCursor();
+        switch (stepDef.effectiveOnFailure(def.failurePolicy())) {
+            case SKIP -> advanceTo(e, def, stepDef);
             case ABORT -> e.markStatus(ExecutionStatus.FAILED);
             case COMPENSATE -> {
                 e.markStatus(ExecutionStatus.FAILED);

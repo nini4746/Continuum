@@ -50,10 +50,12 @@ public class WorkflowController {
     }
 
     @PostMapping("/executions")
-    public ResponseEntity<Map<String, Object>> start(@RequestBody Map<String, String> body) {
-        String name = body.get("workflow");
+    @SuppressWarnings("unchecked")
+    public ResponseEntity<Map<String, Object>> start(@RequestBody Map<String, Object> body) {
+        Object name = body.get("workflow");
         if (name == null) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "workflow required");
-        Execution e = engine.start(name);
+        Map<String, Object> ctx = body.get("context") instanceof Map<?, ?> m ? (Map<String, Object>) m : null;
+        Execution e = engine.start(String.valueOf(name), ctx);
         engine.run(e.getId());
         Execution after = executions.findById(e.getId()).orElseThrow();
         return ResponseEntity.status(HttpStatus.CREATED).body(Map.of(

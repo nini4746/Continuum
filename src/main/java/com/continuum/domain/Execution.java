@@ -28,6 +28,11 @@ public class Execution {
     @Column(length = 1000)
     private String lastError;
 
+    /** JSON map of runtime variables, evaluated by CONDITIONAL steps (spec §3.1.1). */
+    @Lob
+    @Column
+    private String contextJson;
+
     @Column(nullable = false)
     private Instant createdAt;
 
@@ -81,6 +86,19 @@ public class Execution {
 
     public void advanceCursor() {
         this.cursor++;
+        this.updatedAt = Instant.now();
+    }
+
+    /** Jump the cursor to an absolute step index (CONDITIONAL branch / admin step re-run). */
+    public void setCursor(int c) {
+        this.cursor = c;
+        this.updatedAt = Instant.now();
+    }
+
+    public String getContextJson() { return contextJson; }
+
+    public void setContextJson(String json) {
+        this.contextJson = json;
         this.updatedAt = Instant.now();
     }
 

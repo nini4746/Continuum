@@ -48,6 +48,7 @@ public class WorkflowEngine {
     private final DistributedLock distributedLock;
     private final ConditionEvaluator conditions;
     private final EventBus eventBus;
+    private final AuditService audit;
     private final long lockTimeoutMs;
     private final int workerThreads;
     private final boolean exposeRawErrors;
@@ -60,6 +61,7 @@ public class WorkflowEngine {
                           DistributedLock distributedLock,
                           ConditionEvaluator conditions,
                           EventBus eventBus,
+                          AuditService audit,
                           @Value("${continuum.async.threads:4}") int workerThreads,
                           @Value("${continuum.lock.timeout-ms:50}") long lockTimeoutMs,
                           @Value("${continuum.errors.expose-raw-messages:false}") boolean exposeRawErrors) {
@@ -72,6 +74,7 @@ public class WorkflowEngine {
         this.distributedLock = distributedLock;
         this.conditions = conditions;
         this.eventBus = eventBus;
+        this.audit = audit;
         this.workerThreads = Math.max(1, workerThreads);
         this.lockTimeoutMs = Math.max(0, lockTimeoutMs);
         this.exposeRawErrors = exposeRawErrors;
@@ -166,7 +169,19 @@ public class WorkflowEngine {
                 throw new IllegalArgumentException("invalid execution context", ex);
             }
         }
-        return executions.save(e);
+        Execution saved = executions.save(e);
+        audit.record(saved.getId(), null, ExecutionStatus.CREATED, "system", "execution created");
+        return saved;
+    }
+
+    /**
+     * Change execution status and record an audit entry for the transition
+     * (spec §3.6.1 "모든 상태 전이 기록"). No-op transitions are not audited.
+     */
+    private void transition(Execution ex, ExecutionStatus to, String actor, String reason) {
+        ExecutionStatus from = ex.getStatus();
+        ex.markStatus(to);
+        if (from != to) audit.record(ex.getId(), from, to, actor, reason);
     }
 
     @SuppressWarnings("unchecked")
@@ -211,7 +226,7 @@ public class WorkflowEngine {
             }
             log.warn("execution {} exceeded max-steps={} — treating as FAILED", executionId, maxSteps);
             Execution exec = executions.findById(executionId).orElseThrow();
-            exec.markStatus(ExecutionStatus.FAILED);
+            transition(exec, ExecutionStatus.FAILED, "system", "max-steps exceeded");
             exec.setLastError("max-steps exceeded");
             executions.save(exec);
             eventBus.stepTimeout(executionId, null, "max-steps exceeded");
@@ -230,7 +245,7 @@ public class WorkflowEngine {
     private ExecutionStatus runDag(Long executionId, WorkflowDef def) {
         Execution e = executions.findById(executionId).orElseThrow();
         if (e.getStatus() == ExecutionStatus.CREATED) {
-            e.markStatus(ExecutionStatus.RUNNING);
+            transition(e, ExecutionStatus.RUNNING, "system", "dag start");
             executions.save(e);
         }
 
@@ -307,14 +322,14 @@ public class WorkflowEngine {
         Execution latest = executions.findById(executionId).orElseThrow();
         latest.setLastError(terminalError);
         if (abort) {
-            latest.markStatus(ExecutionStatus.FAILED);
+            transition(latest, ExecutionStatus.FAILED, "system", "dag step failed");
             executions.save(latest);
             if (compensate) {
                 compensateDag(latest, def, done);
             }
             return latest.getStatus();
         }
-        latest.markStatus(ExecutionStatus.COMPLETED);
+        transition(latest, ExecutionStatus.COMPLETED, "system", "dag completed");
         executions.save(latest);
         return ExecutionStatus.COMPLETED;
     }
@@ -373,7 +388,7 @@ public class WorkflowEngine {
                         StepStatus.FAILED, 0, "compensate failed: " + sanitizeError(ex)));
             }
         }
-        e.markStatus(ExecutionStatus.COMPENSATED);
+        transition(e, ExecutionStatus.COMPENSATED, "system", "dag compensation complete");
         executions.save(e);
     }
 
@@ -415,11 +430,11 @@ public class WorkflowEngine {
             return e.getStatus();
         }
         if (e.getStatus() == ExecutionStatus.CREATED) {
-            e.markStatus(ExecutionStatus.RUNNING);
+            transition(e, ExecutionStatus.RUNNING, "system", "execution started");
         }
         WorkflowDef def = defOf(e);
         if (e.getCursor() >= def.steps().size()) {
-            e.markStatus(ExecutionStatus.COMPLETED);
+            transition(e, ExecutionStatus.COMPLETED, "system", "all steps completed");
             executions.save(e);
             return ExecutionStatus.COMPLETED;
         }
@@ -439,7 +454,7 @@ public class WorkflowEngine {
             stepRecords.saveAndFlush(
                     new StepRecord(e.getId(), stepDef.id(), StepStatus.STARTED, 0, "awaiting approval"));
         } catch (DataIntegrityViolationException ignore) { /* already recorded */ }
-        e.markStatus(ExecutionStatus.WAITING);
+        transition(e, ExecutionStatus.WAITING, "system", "awaiting approval at " + stepDef.id());
     }
 
     /**
@@ -538,9 +553,9 @@ public class WorkflowEngine {
         eventBus.stepFailed(e.getId(), stepDef.id(), message);
         switch (stepDef.effectiveOnFailure(def.failurePolicy())) {
             case SKIP -> advanceTo(e, def, stepDef);
-            case ABORT -> e.markStatus(ExecutionStatus.FAILED);
+            case ABORT -> transition(e, ExecutionStatus.FAILED, "system", stepDef.id() + " failed (ABORT)");
             case COMPENSATE -> {
-                e.markStatus(ExecutionStatus.FAILED);
+                transition(e, ExecutionStatus.FAILED, "system", stepDef.id() + " failed (COMPENSATE)");
                 compensate(e);
             }
         }
@@ -561,7 +576,7 @@ public class WorkflowEngine {
                         StepStatus.FAILED, 0, "compensate failed: " + sanitizeError(ex)));
             }
         }
-        e.markStatus(ExecutionStatus.COMPENSATED);
+        transition(e, ExecutionStatus.COMPENSATED, "system", "compensation complete");
     }
 
     private void sleepQuiet(long ms) {
@@ -597,7 +612,7 @@ public class WorkflowEngine {
                 throw new IllegalStateException("current step is not a human-approval gate");
             }
             String who = (actor == null || actor.isBlank()) ? "unknown" : actor;
-            e.markStatus(ExecutionStatus.RUNNING);
+            transition(e, ExecutionStatus.RUNNING, who, approved ? "approved" : "rejected");
             if (approved) {
                 stepRecords.save(new StepRecord(e.getId(), gate.id(), StepStatus.SUCCEEDED, 1,
                         "approved by " + who));

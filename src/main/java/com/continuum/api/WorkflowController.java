@@ -4,6 +4,7 @@ import com.continuum.domain.Execution;
 import com.continuum.domain.WorkflowEntity;
 import com.continuum.dto.WorkflowDef;
 import com.continuum.engine.WorkflowEngine;
+import com.continuum.repo.AuditLogRepo;
 import com.continuum.repo.EventRecordRepo;
 import com.continuum.repo.ExecutionRepo;
 import com.continuum.repo.StepRecordRepo;
@@ -27,15 +28,17 @@ public class WorkflowController {
     private final StepRecordRepo stepRecords;
     private final WorkflowRepo workflows;
     private final EventRecordRepo eventRecords;
+    private final AuditLogRepo auditLogs;
 
     public WorkflowController(WorkflowEngine engine, ExecutionRepo executions,
                               StepRecordRepo stepRecords, WorkflowRepo workflows,
-                              EventRecordRepo eventRecords) {
+                              EventRecordRepo eventRecords, AuditLogRepo auditLogs) {
         this.engine = engine;
         this.executions = executions;
         this.stepRecords = stepRecords;
         this.workflows = workflows;
         this.eventRecords = eventRecords;
+        this.auditLogs = auditLogs;
     }
 
     @PostMapping("/workflows")
@@ -145,6 +148,17 @@ public class WorkflowController {
                         "type", ev.getType().name(),
                         "stepId", ev.getStepId() == null ? "" : ev.getStepId(),
                         "message", ev.getMessage() == null ? "" : ev.getMessage()
+                )).toList());
+    }
+
+    @GetMapping("/executions/{id}/audit")
+    public Map<String, Object> auditTrail(@PathVariable Long id) {
+        return Map.of("id", id, "audit", auditLogs.findByExecutionIdOrderByCreatedAtAsc(id).stream()
+                .map(a -> Map.of(
+                        "from", a.getFromStatus() == null ? "" : a.getFromStatus().name(),
+                        "to", a.getToStatus().name(),
+                        "actor", a.getActor(),
+                        "reason", a.getReason() == null ? "" : a.getReason()
                 )).toList());
     }
 

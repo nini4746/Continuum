@@ -107,6 +107,33 @@ public class WorkflowController {
         }
     }
 
+    @PostMapping("/executions/{id}/approve")
+    public Map<String, Object> approve(@PathVariable Long id, @RequestBody(required = false) Map<String, Object> body) {
+        String actor = body == null ? null : String.valueOf(body.getOrDefault("actor", "unknown"));
+        try {
+            var status = engine.approve(id, actor);
+            return Map.of("id", id, "status", status.name());
+        } catch (IllegalStateException ise) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, ise.getMessage());
+        } catch (IllegalArgumentException iae) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, iae.getMessage());
+        }
+    }
+
+    @PostMapping("/executions/{id}/reject")
+    public Map<String, Object> reject(@PathVariable Long id, @RequestBody(required = false) Map<String, Object> body) {
+        String actor = body == null ? null : String.valueOf(body.getOrDefault("actor", "unknown"));
+        String reason = body == null ? null : (body.get("reason") == null ? null : String.valueOf(body.get("reason")));
+        try {
+            var status = engine.reject(id, actor, reason);
+            return Map.of("id", id, "status", status.name());
+        } catch (IllegalStateException ise) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, ise.getMessage());
+        } catch (IllegalArgumentException iae) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, iae.getMessage());
+        }
+    }
+
     @GetMapping("/executions/{id}")
     public Map<String, Object> get(@PathVariable Long id) {
         Execution e = executions.findById(id)

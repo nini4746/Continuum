@@ -420,10 +420,20 @@ public class WorkflowEngine {
         StepDef stepDef = def.steps().get(e.getCursor());
         switch (stepDef.kind()) {
             case CONDITIONAL -> handleConditional(e, def, stepDef);
+            case HUMAN_APPROVAL -> parkForApproval(e, stepDef);
             default -> runOneStep(e, def, stepDef);
         }
         executions.save(e);
         return e.getStatus();
+    }
+
+    /** Park the execution in WAITING until an approve/reject decision arrives (spec §3.1.1). */
+    private void parkForApproval(Execution e, StepDef stepDef) {
+        try {
+            stepRecords.saveAndFlush(
+                    new StepRecord(e.getId(), stepDef.id(), StepStatus.STARTED, 0, "awaiting approval"));
+        } catch (DataIntegrityViolationException ignore) { /* already recorded */ }
+        e.markStatus(ExecutionStatus.WAITING);
     }
 
     /**
@@ -548,6 +558,58 @@ public class WorkflowEngine {
 
     private void sleepQuiet(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+    }
+
+    /**
+     * Approve a HUMAN_APPROVAL step (spec §3.1.1): record the approval, move past the
+     * gate, and resume the workflow. Rejects if the execution is not WAITING on an
+     * approval step.
+     */
+    public ExecutionStatus approve(Long executionId, String actor) {
+        return decide(executionId, actor, true, null);
+    }
+
+    public ExecutionStatus reject(Long executionId, String actor, String reason) {
+        return decide(executionId, actor, false, reason);
+    }
+
+    private ExecutionStatus decide(Long executionId, String actor, boolean approved, String reason) {
+        String lockKey = executionLockKey(executionId);
+        DistributedLock.Token token = distributedLock.tryLock(lockKey, lockTimeoutMs, TimeUnit.MILLISECONDS);
+        if (token == null) throw new IllegalStateException("execution " + executionId + " is busy");
+        try {
+            Execution e = executions.findById(executionId)
+                    .orElseThrow(() -> new IllegalArgumentException("unknown execution: " + executionId));
+            if (e.getStatus() != ExecutionStatus.WAITING) {
+                throw new IllegalStateException("execution " + executionId + " is not awaiting approval");
+            }
+            WorkflowDef def = defOf(e);
+            StepDef gate = def.steps().get(e.getCursor());
+            if (gate.kind() != com.continuum.dto.StepKind.HUMAN_APPROVAL) {
+                throw new IllegalStateException("current step is not a human-approval gate");
+            }
+            String who = (actor == null || actor.isBlank()) ? "unknown" : actor;
+            e.markStatus(ExecutionStatus.RUNNING);
+            if (approved) {
+                stepRecords.save(new StepRecord(e.getId(), gate.id(), StepStatus.SUCCEEDED, 1,
+                        "approved by " + who));
+                advanceTo(e, def, gate);
+                executions.save(e);
+            } else {
+                stepRecords.save(new StepRecord(e.getId(), gate.id(), StepStatus.FAILED, 1,
+                        "rejected by " + who + (reason == null ? "" : ": " + reason)));
+                handleTerminalFailure(e, def, gate, "rejected by " + who);
+                executions.save(e);
+            }
+        } finally {
+            distributedLock.unlock(lockKey, token);
+        }
+        // continue outside the lock (run() re-acquires) if still runnable
+        Execution after = executions.findById(executionId).orElseThrow();
+        if (after.getStatus() == ExecutionStatus.RUNNING) {
+            return run(executionId);
+        }
+        return after.getStatus();
     }
 
     public boolean recordDuplicateForReplayCheck(Long executionId, String stepId, int attempt) {

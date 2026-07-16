@@ -47,6 +47,7 @@ public class WorkflowEngine {
     private final RetryStrategy retryStrategy;
     private final DistributedLock distributedLock;
     private final ConditionEvaluator conditions;
+    private final EventBus eventBus;
     private final long lockTimeoutMs;
     private final int workerThreads;
     private final boolean exposeRawErrors;
@@ -58,6 +59,7 @@ public class WorkflowEngine {
                           RetryStrategy retryStrategy,
                           DistributedLock distributedLock,
                           ConditionEvaluator conditions,
+                          EventBus eventBus,
                           @Value("${continuum.async.threads:4}") int workerThreads,
                           @Value("${continuum.lock.timeout-ms:50}") long lockTimeoutMs,
                           @Value("${continuum.errors.expose-raw-messages:false}") boolean exposeRawErrors) {
@@ -69,6 +71,7 @@ public class WorkflowEngine {
         this.retryStrategy = retryStrategy;
         this.distributedLock = distributedLock;
         this.conditions = conditions;
+        this.eventBus = eventBus;
         this.workerThreads = Math.max(1, workerThreads);
         this.lockTimeoutMs = Math.max(0, lockTimeoutMs);
         this.exposeRawErrors = exposeRawErrors;
@@ -211,6 +214,7 @@ public class WorkflowEngine {
             exec.markStatus(ExecutionStatus.FAILED);
             exec.setLastError("max-steps exceeded");
             executions.save(exec);
+            eventBus.stepTimeout(executionId, null, "max-steps exceeded");
             return ExecutionStatus.FAILED;
         } finally {
             distributedLock.unlock(lockKey, token);
@@ -331,6 +335,7 @@ public class WorkflowEngine {
                 handler.execute(stepDef.inputs());
                 stepRecords.saveAndFlush(
                         new StepRecord(executionId, stepDef.id(), StepStatus.SUCCEEDED, attempt, null));
+                eventBus.stepCompleted(executionId, stepDef.id());
                 return new DagResult(stepDef.id(), true, null);
             } catch (DataIntegrityViolationException dup) {
                 log.warn("duplicate dag step record exec={} step={} attempt={}", executionId, stepDef.id(), attempt);
@@ -347,6 +352,7 @@ public class WorkflowEngine {
                 if (backoff > 0) sleepQuiet(backoff);
             }
         }
+        eventBus.stepFailed(executionId, stepDef.id(), lastError == null ? "unknown" : lastError);
         return new DagResult(stepDef.id(), false, lastError == null ? "unknown" : lastError);
     }
 
@@ -499,6 +505,7 @@ public class WorkflowEngine {
                 handler.execute(stepDef.inputs());
                 stepRecords.saveAndFlush(
                         new StepRecord(e.getId(), stepDef.id(), StepStatus.SUCCEEDED, attempt, null));
+                eventBus.stepCompleted(e.getId(), stepDef.id());
                 advanceTo(e, def, stepDef);
                 e.setLastError(null);
                 return;
@@ -528,6 +535,7 @@ public class WorkflowEngine {
 
     private void handleTerminalFailure(Execution e, WorkflowDef def, StepDef stepDef, String message) {
         e.setLastError(stepDef.id() + ": " + message);
+        eventBus.stepFailed(e.getId(), stepDef.id(), message);
         switch (stepDef.effectiveOnFailure(def.failurePolicy())) {
             case SKIP -> advanceTo(e, def, stepDef);
             case ABORT -> e.markStatus(ExecutionStatus.FAILED);

@@ -4,6 +4,7 @@ import com.continuum.domain.Execution;
 import com.continuum.domain.WorkflowEntity;
 import com.continuum.dto.WorkflowDef;
 import com.continuum.engine.WorkflowEngine;
+import com.continuum.repo.EventRecordRepo;
 import com.continuum.repo.ExecutionRepo;
 import com.continuum.repo.StepRecordRepo;
 import com.continuum.repo.WorkflowRepo;
@@ -25,13 +26,16 @@ public class WorkflowController {
     private final ExecutionRepo executions;
     private final StepRecordRepo stepRecords;
     private final WorkflowRepo workflows;
+    private final EventRecordRepo eventRecords;
 
     public WorkflowController(WorkflowEngine engine, ExecutionRepo executions,
-                              StepRecordRepo stepRecords, WorkflowRepo workflows) {
+                              StepRecordRepo stepRecords, WorkflowRepo workflows,
+                              EventRecordRepo eventRecords) {
         this.engine = engine;
         this.executions = executions;
         this.stepRecords = stepRecords;
         this.workflows = workflows;
+        this.eventRecords = eventRecords;
     }
 
     @PostMapping("/workflows")
@@ -132,6 +136,16 @@ public class WorkflowController {
         } catch (IllegalArgumentException iae) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, iae.getMessage());
         }
+    }
+
+    @GetMapping("/executions/{id}/events")
+    public Map<String, Object> events(@PathVariable Long id) {
+        return Map.of("id", id, "events", eventRecords.findByExecutionIdOrderByCreatedAtAsc(id).stream()
+                .map(ev -> Map.of(
+                        "type", ev.getType().name(),
+                        "stepId", ev.getStepId() == null ? "" : ev.getStepId(),
+                        "message", ev.getMessage() == null ? "" : ev.getMessage()
+                )).toList());
     }
 
     @GetMapping("/executions/{id}")

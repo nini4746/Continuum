@@ -243,7 +243,7 @@ public class WorkflowEngine {
                 } else {
                     terminalError = r.errorMessage;
                     StepDef failedStep = stepById.get(r.stepId);
-                    switch (failedStep.onFailure()) {
+                    switch (failedStep.effectiveOnFailure(def.failurePolicy())) {
                         case SKIP -> {
                             done.add(r.stepId);
                             remainingDeps.remove(r.stepId);
@@ -422,7 +422,7 @@ public class WorkflowEngine {
 
     private void handleTerminalFailure(Execution e, StepDef stepDef, String message) {
         e.setLastError(stepDef.id() + ": " + message);
-        switch (stepDef.onFailure()) {
+        switch (stepDef.effectiveOnFailure(defOf(e).failurePolicy())) {
             case SKIP -> e.advanceCursor();
             case ABORT -> e.markStatus(ExecutionStatus.FAILED);
             case COMPENSATE -> {

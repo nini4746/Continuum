@@ -635,6 +635,81 @@ public class WorkflowEngine {
         return after.getStatus();
     }
 
+    // ---- Admin / operations (spec §3.7) --------------------------------------
+
+    /** Force-stop an execution (spec §3.7 "Execution 강제 중단"). */
+    public ExecutionStatus cancel(Long executionId, String actor) {
+        String lockKey = executionLockKey(executionId);
+        DistributedLock.Token token = distributedLock.tryLock(lockKey, lockTimeoutMs, TimeUnit.MILLISECONDS);
+        if (token == null) throw new IllegalStateException("execution " + executionId + " is busy");
+        try {
+            Execution e = executions.findById(executionId)
+                    .orElseThrow(() -> new IllegalArgumentException("unknown execution: " + executionId));
+            if (e.getStatus().isTerminal()) {
+                throw new IllegalStateException("execution " + executionId + " is already " + e.getStatus());
+            }
+            transition(e, ExecutionStatus.CANCELED, actor, "admin cancel");
+            executions.save(e);
+            return e.getStatus();
+        } finally {
+            distributedLock.unlock(lockKey, token);
+        }
+    }
+
+    /**
+     * Force an arbitrary status change bypassing the transition rules (spec §3.7
+     * "강제 상태 변경 (로그 필수)"). A reason is mandatory and always audited.
+     */
+    public void forceStatus(Long executionId, ExecutionStatus target, String actor, String reason) {
+        if (reason == null || reason.isBlank()) {
+            throw new IllegalArgumentException("a reason is required for a forced status change");
+        }
+        Execution e = executions.findById(executionId)
+                .orElseThrow(() -> new IllegalArgumentException("unknown execution: " + executionId));
+        ExecutionStatus from = e.getStatus();
+        e.forceStatus(target);
+        audit.record(executionId, from, target, actor, "FORCED: " + reason);
+        executions.save(e);
+    }
+
+    /** Re-execute a specific step (spec §3.7 "특정 Step 재실행"), then resume. */
+    public ExecutionStatus rerunStep(Long executionId, String stepId, String actor) {
+        String lockKey = executionLockKey(executionId);
+        DistributedLock.Token token = distributedLock.tryLock(lockKey, lockTimeoutMs, TimeUnit.MILLISECONDS);
+        if (token == null) throw new IllegalStateException("execution " + executionId + " is busy");
+        try {
+            Execution e = executions.findById(executionId)
+                    .orElseThrow(() -> new IllegalArgumentException("unknown execution: " + executionId));
+            WorkflowDef def = defOf(e);
+            int idx = indexOfStep(def, stepId);
+            if (idx < 0) throw new IllegalArgumentException("unknown step: " + stepId);
+            stepRecords.deleteByExecutionIdAndStepId(executionId, stepId); // clear so it truly re-runs
+            ExecutionStatus from = e.getStatus();
+            e.forceStatus(ExecutionStatus.RUNNING);
+            e.setCursor(idx);
+            audit.record(executionId, from, ExecutionStatus.RUNNING, actor, "rerun step " + stepId);
+            executions.save(e);
+        } finally {
+            distributedLock.unlock(lockKey, token);
+        }
+        return run(executionId);
+    }
+
+    /** RUNNING executions with no progress for {@code minutes} — likely dead (spec §3.7). */
+    public List<Execution> deadExecutions(long minutes) {
+        return executions.findByStatusAndUpdatedAtBefore(
+                ExecutionStatus.RUNNING, java.time.Instant.now().minusSeconds(Math.max(0, minutes) * 60));
+    }
+
+    /** Execution counts by status (spec §3.7 "실행 통계 조회"). */
+    public Map<String, Long> stats() {
+        Map<String, Long> out = new java.util.LinkedHashMap<>();
+        for (ExecutionStatus s : ExecutionStatus.values()) {
+            out.put(s.name(), executions.countByStatus(s));
+        }
+        return out;
+    }
+
     public boolean recordDuplicateForReplayCheck(Long executionId, String stepId, int attempt) {
         return stepRecords.existsByExecutionIdAndStepIdAndAttempt(executionId, stepId, attempt);
     }

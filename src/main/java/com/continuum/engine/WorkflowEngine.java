@@ -185,7 +185,7 @@ public class WorkflowEngine {
      */
     private ExecutionStatus runDag(Long executionId, WorkflowDef def) {
         Execution e = executions.findById(executionId).orElseThrow();
-        if (e.getStatus() == ExecutionStatus.PENDING) {
+        if (e.getStatus() == ExecutionStatus.CREATED) {
             e.markStatus(ExecutionStatus.RUNNING);
             executions.save(e);
         }
@@ -363,10 +363,12 @@ public class WorkflowEngine {
                 .orElseThrow(() -> new IllegalArgumentException("unknown execution: " + executionId));
         if (e.getStatus() == ExecutionStatus.COMPLETED
                 || e.getStatus() == ExecutionStatus.FAILED
-                || e.getStatus() == ExecutionStatus.COMPENSATED) {
+                || e.getStatus() == ExecutionStatus.CANCELED
+                || e.getStatus() == ExecutionStatus.COMPENSATED
+                || e.getStatus() == ExecutionStatus.WAITING) {
             return e.getStatus();
         }
-        if (e.getStatus() == ExecutionStatus.PENDING) {
+        if (e.getStatus() == ExecutionStatus.CREATED) {
             e.markStatus(ExecutionStatus.RUNNING);
         }
         WorkflowDef def = defOf(e);

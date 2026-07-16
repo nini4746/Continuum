@@ -34,7 +34,7 @@ public class Execution {
 
     public Execution(Long workflowId) {
         this.workflowId = workflowId;
-        this.status = ExecutionStatus.PENDING;
+        this.status = ExecutionStatus.CREATED;
         this.cursor = 0;
         this.createdAt = Instant.now();
         this.updatedAt = this.createdAt;
@@ -48,7 +48,23 @@ public class Execution {
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
 
+    /**
+     * Transition to {@code s} following the explicit state machine (spec §3.2.1).
+     * Same-state calls are idempotent no-ops; any other undeclared edge is rejected.
+     */
     public void markStatus(ExecutionStatus s) {
+        if (s != this.status && !this.status.canTransitionTo(s)) {
+            throw new IllegalStateException("illegal execution transition: " + this.status + " -> " + s);
+        }
+        this.status = s;
+        this.updatedAt = Instant.now();
+    }
+
+    /**
+     * Admin override that bypasses the transition rules (spec §3.7 "강제 상태 변경").
+     * Callers MUST record an audit entry; the engine never uses this on the happy path.
+     */
+    public void forceStatus(ExecutionStatus s) {
         this.status = s;
         this.updatedAt = Instant.now();
     }

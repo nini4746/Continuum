@@ -3,6 +3,7 @@ package com.continuum.api;
 import com.continuum.domain.Execution;
 import com.continuum.domain.WorkflowEntity;
 import com.continuum.dto.WorkflowDef;
+import com.continuum.engine.ReplayService;
 import com.continuum.engine.WorkflowEngine;
 import com.continuum.repo.AuditLogRepo;
 import com.continuum.repo.EventRecordRepo;
@@ -29,16 +30,19 @@ public class WorkflowController {
     private final WorkflowRepo workflows;
     private final EventRecordRepo eventRecords;
     private final AuditLogRepo auditLogs;
+    private final ReplayService replayService;
 
     public WorkflowController(WorkflowEngine engine, ExecutionRepo executions,
                               StepRecordRepo stepRecords, WorkflowRepo workflows,
-                              EventRecordRepo eventRecords, AuditLogRepo auditLogs) {
+                              EventRecordRepo eventRecords, AuditLogRepo auditLogs,
+                              ReplayService replayService) {
         this.engine = engine;
         this.executions = executions;
         this.stepRecords = stepRecords;
         this.workflows = workflows;
         this.eventRecords = eventRecords;
         this.auditLogs = auditLogs;
+        this.replayService = replayService;
     }
 
     @PostMapping("/workflows")
@@ -149,6 +153,22 @@ public class WorkflowController {
                         "stepId", ev.getStepId() == null ? "" : ev.getStepId(),
                         "message", ev.getMessage() == null ? "" : ev.getMessage()
                 )).toList());
+    }
+
+    @GetMapping("/executions/{id}/replay")
+    public Map<String, Object> replay(@PathVariable Long id) {
+        try {
+            var trace = replayService.replay(id);
+            return Map.of(
+                    "id", trace.executionId(),
+                    "workflow", trace.workflowName(),
+                    "workflowVersion", trace.workflowVersion(),
+                    "frames", trace.frames().stream()
+                            .map(f -> Map.of("seq", f.seq(), "kind", f.kind(), "detail", f.detail()))
+                            .toList());
+        } catch (IllegalArgumentException iae) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, iae.getMessage());
+        }
     }
 
     @GetMapping("/executions/{id}/audit")
